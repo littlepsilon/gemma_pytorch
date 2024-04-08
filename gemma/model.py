@@ -35,7 +35,7 @@ class Sampler(nn.Module):
         embedding: torch.Tensor,
         hidden_states: torch.Tensor,
         output_positions: torch.Tensor,
-        temperatures: Union[torch.Tensor, None],
+        temperatures: torch.Tensor,
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
         embedding_bias: Optional[torch.Tensor] = None,
@@ -120,7 +120,8 @@ class Linear(nn.Module):
                 requires_grad=False,
             )
         self.quant = quant
-
+    
+    @torch.no_grad()
     def forward(self, x):
         weight = self.weight
         if self.quant:
@@ -145,7 +146,8 @@ class Embedding(nn.Module):
                 requires_grad=False,
             )
         self.quant = quant
-
+    
+    @torch.no_grad()
     def forward(self, x):
         weight = self.weight
         if self.quant:
@@ -170,6 +172,7 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    @torch.no_grad()
     def forward(self, x):
         x = self._norm(x.float()).type_as(x)
         if self.add_unit_offset:
@@ -191,7 +194,8 @@ class GemmaMLP(nn.Module):
         self.gate_proj = Linear(hidden_size, intermediate_size, quant)
         self.up_proj = Linear(hidden_size, intermediate_size, quant)
         self.down_proj = Linear(intermediate_size, hidden_size, quant)
-
+    
+    @torch.no_grad()
     def forward(self, x):
         gate = self.gate_proj(x)
         gate = F.gelu(gate, approximate="tanh")
@@ -235,7 +239,8 @@ class GemmaAttention(nn.Module):
             self.num_heads * self.head_dim,
             self.hidden_size,
             quant=quant)
-
+    
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -320,7 +325,7 @@ class GemmaDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -361,7 +366,8 @@ class GemmaModel(nn.Module):
         for _ in range(config.num_hidden_layers):
             self.layers.append(GemmaDecoderLayer(config))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+    
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -418,7 +424,7 @@ class GemmaForCausalLM(nn.Module):
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         mask: torch.Tensor,
         output_positions: torch.Tensor,
-        temperatures: Union[torch.Tensor, None],
+        temperatures: torch.Tensor,
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
         **kwargs,
@@ -457,7 +463,7 @@ class GemmaForCausalLM(nn.Module):
         prompts: Union[str, Sequence[str]],
         device: Any,
         output_len: int = 100,
-        temperature: Union[float, None] = 0.95,
+        temperature: float = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
     ) -> Union[str, Sequence[str]]:
@@ -505,8 +511,8 @@ class GemmaForCausalLM(nn.Module):
         curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
         output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(
             device)
-        temperatures_tensor = None if not temperature else torch.FloatTensor(
-            [temperature] * batch_size).to(device)
+        temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(
+            device)
         top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
         top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
         output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
@@ -514,6 +520,7 @@ class GemmaForCausalLM(nn.Module):
 
         # Prefill up to min_prompt_len tokens, then treat other prefill as
         # decode and ignore output.
+        end_token_seen = torch.zeros(batch_size, dtype=torch.bool, device=device)
         for i in range(max_seq_len - min_prompt_len):
             next_token_ids = self(
                 input_token_ids=input_token_ids_tensor,
@@ -542,6 +549,9 @@ class GemmaForCausalLM(nn.Module):
             output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
                 device)
             output_index = output_index + 1
+            end_token_seen |= (next_token_ids == self.tokenizer.eos_id)
+            if end_token_seen.all():
+                break
 
         # Detokenization.
         token_ids = token_ids_tensor.tolist()
